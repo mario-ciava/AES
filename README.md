@@ -2,128 +2,196 @@
 # AES Encryption Library
 
 ## Overview
-This project implements the **Advanced Encryption Standard (AES)** algorithm in **JavaScript** using Node.js. The goal is to provide a flexible and self-contained library for encrypting and decrypting data without external dependencies. 
+This repository contains a dependency-free implementation of the **Advanced Encryption Standard (AES)** written in modern JavaScript.  
+The goal is to keep the code readable, auditable and easy to embed in projects where pulling in third-party crypto packages is not an option.  
+All primitives – AES core, PKCS#7, SHA‑256, HMAC-SHA256, PBKDF2-HMAC – are implemented in pure JS.
 
 ## Features
-- **Support for 128, 192, and 256-bit keys**.
-- **Two modes**: Electronic Codebook (ECB) and Cipher Block Chaining (CBC).
-- **PKCS7 Padding**: Automated or manual padding support.
-- **Configurable HMAC** for message authentication.
-- **Extensible and modular code** design for easy maintenance and enhancements.
+- AES-128, AES-192, AES-256 (fixed 128-bit blocks).
+- Modes: ECB, CBC, PCBC, CTR, CFB, OFB, GCM (with native auth tag).
+- Automatic or explicit PKCS#7 padding for block modes.
+- Optional PBKDF2 key derivation and HMAC-SHA256 authentication (auto-disabled for GCM).
+- Pure utility exports (`sha256`, `hmacSha256`, `pbkdf2Sha256`, `timingSafeEqualHex`, etc.).
+- Large regression suite: NIST KATs, fuzzing, 256 KiB block stress test.
 
 ## Table of Contents
 - [Installation](#installation)
 - [Usage](#usage)
 - [Configuration Options](#configuration-options)
-- [Example](#example)
+- [Examples](#examples)
 - [Running Tests](#running-tests)
-- [Future Goals](#future-goals)
+- [Security Notes](#security-notes)
+- [Future Work](#future-work)
 - [License](#license)
 
 ## Installation
-1. **Clone the Repository**:
+1. **Clone**
    ```bash
    git clone https://github.com/mario-ciava/AES.git
    cd AES
    ```
 
-2. **Install Node.js**:
-   This project has been tested with Node.js version 20.18.0. It is recommended to use Node.js version 14 or higher to ensure compatibility and stability. No additional dependencies are required. You can download Node.js from the official [Node.js website](https://nodejs.org/).
+2. **Environment**
+   - Tested with Node.js ≥ 20.18.0. Any recent Node 18+ build should work.
+   - No npm install required. Everything lives in `*.mjs`.
 
 ## Usage
-Import the AES class and create an instance:
+Import what you need from `cipher.mjs`. The default export is the `AES` class; `createAES` is a convenience factory; helper functions are exported for lower-level use.
 
 ```javascript
-import { AES } from './cipher_v1.0.mjs';
-
-const aes = new AES();
-const options = {
-    bits: 128,
-    mode: 'CBC',
-    deriveKey: true,
-    usePKCS7: true,
-    addSalt: true,
-    addHMAC: true
-};
-
-// Example encryption
-const { message, IV, salt, HMAC } = aes.encrypt('Hello, World!', 'secret-key', options);
-
-// Example decryption
-const decryptedMessage = aes.decrypt(message, 'secret-key', { ...options, IV, salt, HMAC });
-console.log(decryptedMessage);
+import {
+  AES,
+  createAES,
+  getDefaultAESOptions,
+  sha256,
+  hmacSha256,
+  pbkdf2Sha256,
+  timingSafeEqualHex,
+} from './cipher.mjs';
 ```
 
+### RNG requirement
+The library relies on a **secure random source**. If `globalThis.crypto.getRandomValues` is missing (e.g. some sandboxed environments), you must provide `options.rng = (len) => Uint8Array`.
+
+### Text vs hex input
+- Plaintext and keys can be supplied as UTF-8 strings or hex strings. Non-hex inputs are transparently encoded as UTF-8 hex.
+- Ciphertext must be hex.
+
+### Default behaviour
+Out of the box:
+- Mode: `CBC`.
+- Padding: PKCS#7 enabled.
+- HMAC-SHA256 on `(IV || salt || ciphertext)`.
+- Random IV generated per encryption.
+- No implicit key stretching unless `deriveKey` is true.
+- When `mode: 'GCM'`, the library disables HMAC automatically and returns the GCM authentication tag.
+
 ## Configuration Options
-Below are the available configuration options and their accepted values:
 
-| Option       | Description                                      | Accepted Values                  |
-|--------------|--------------------------------------------------|----------------------------------|
-| `bits`       | Key size in bits                                 | `[128, 192, 256]`                |
-| `mode`       | Encryption mode                                  | `['ECB', 'CBC']`                 |
-| `deriveKey`  | Whether to derive a key using a KDF              | `[true, false]`                  |
-| `addSalt`    | Whether to add salt during key transformation    | `[true, false]`                  |
-| `usePKCS7`   | Enable PKCS7 padding                             | `[true, false]`                  |
-| `addHMAC`    | Add HMAC for message authentication              | `[true, false]`                  |
+| Option        | Default | Description                                                                                       | Accepted values                          |
+|---------------|---------|---------------------------------------------------------------------------------------------------|------------------------------------------|
+| `bits`        | 128     | Key size (drives key length checks / PBKDF2 output).                                              | `128`, `192`, `256`                      |
+| `mode`        | `CBC`   | AES mode. Streaming modes ignore PKCS#7.                                                          | `'ECB'`, `'CBC'`, `'PCBC'`, `'CTR'`, `'CFB'`, `'OFB'`, `'GCM'` |
+| `deriveKey`   | `false` | When true, PBKDF2-HMAC-SHA256 derives the working key.                                            | `true`, `false`                          |
+| `addSalt`     | `false` | Attach a salt to outputs; mandatory when `deriveKey` is true.                                     | `true`, `false`                          |
+| `usePKCS7`    | `true`  | Enable PKCS#7 padding (block modes only). When false, plaintext length must be a multiple of 16.  | `true`, `false`                          |
+| `addHMAC`     | `true`  | Calculate HMAC-SHA256 (skipped automatically for GCM).                                            | `true`, `false`                          |
+| `IV`          | `null`  | Initialization vector. Auto-generated if omitted (16 bytes for block/stream modes, 12/16 for GCM).| 24 or 32 hex chars                       |
+| `salt`        | `null`  | Hex salt for PBKDF2. Auto-generated when `rng` is available.                                      | Even-length hex                          |
+| `iterations`  | 100000  | PBKDF2 iteration count.                                                                            | Positive integer                         |
+| `AAD`         | `null`  | Additional authenticated data (GCM only).                                                         | Even-length hex                          |
+| `tag`         | `null`  | Authentication tag expected during GCM decrypt.                                                   | 32 hex chars (16 bytes)                  |
+| `rng`         | system  | Function returning a `Uint8Array` of random bytes.                                                | `(len:number)=>Uint8Array`               |
 
-## Example
-This example demonstrates encrypting and decrypting a message using a 256-bit key and CBC mode with a derived key and HMAC enabled.
+Retrieve a copy of the defaults at runtime:
+```javascript
+const defaults = getDefaultAESOptions();
+```
 
+## Examples
+
+### Basic CBC encryption with auto IV/HMAC
+```javascript
+import { AES } from './cipher.mjs';
+
+const aes = new AES(); // defaults: CBC, HMAC enabled, PKCS#7 enabled
+
+const { message, IV, HMAC } = aes.encrypt('Top secret note', 'my password');
+const { message: decrypted } = aes.decrypt(message, 'my password', { IV, HMAC });
+
+// decrypted is a hex string; convert to text if you need the original message
+const text = Buffer.from(decrypted, 'hex').toString('utf8');
+console.log(text);
+```
+
+### Using PBKDF2 (salt generated automatically)
 ```javascript
 const aes = new AES();
-const options = {
-    bits: 256,
-    mode: 'CBC',
-    deriveKey: true,
-    addSalt: true,
-    usePKCS7: true,
-    addHMAC: true
+const opts = { deriveKey: true, addSalt: true, iterations: 200000 };
+
+const encrypted = aes.encrypt('plaintext', 'passphrase', opts);
+const decrypted = aes.decrypt(encrypted.message, 'passphrase', {
+  ...opts,
+  IV: encrypted.IV,
+  salt: encrypted.salt,
+  HMAC: encrypted.HMAC,
+});
+```
+
+### Authenticated AES-GCM with AAD
+```javascript
+const aes = new AES();
+const opts = {
+  mode: 'GCM',
+  IV: 'cafebabefacedbaddecaf888',    // 12-byte nonce (in hex)
+  AAD: 'feedfacedeadbeeffeedfacedeadbeefabaddad2',
 };
 
-const result = aes.encrypt('Sensitive Data Here', 'ComplexKey', options);
-console.log('Encrypted Message:', result.message);
-console.log('IV:', result.IV);
-console.log('Salt:', result.salt);
-console.log('HMAC:', result.HMAC);
+const enc = aes.encrypt('Sensitive Data Here', 'ComplexKey', opts);
+console.log('Ciphertext:', enc.message);
+console.log('Tag:', enc.tag);
 
-// Decrypting
-const decryptedMessage = aes.decrypt(result.message, 'ComplexKey', {
-    ...options,
-    IV: result.IV,
-    salt: result.salt,
-    HMAC: result.HMAC
+const dec = aes.decrypt(enc.message, 'ComplexKey', {
+  ...opts,
+  tag: enc.tag,
 });
-console.log('Decrypted Message:', decryptedMessage);
+console.log('Plain (hex):', dec.message);
+```
+
+### Creating a preconfigured instance
+```javascript
+import { createAES } from './cipher.mjs';
+import { randomBytes } from 'node:crypto'; // or your own Uint8Array source
+
+const aes256 = createAES({
+  bits: 256,
+  addHMAC: false,
+  rng: (len) => randomBytes(len),
+});
+
+const { message } = aes256.encrypt('hex only demo', '00112233445566778899aabbccddeeff', { mode: 'ECB', usePKCS7: false });
+```
+
+### Reusing utilities
+```javascript
+import { sha256, hmacSha256, pbkdf2Sha256 } from './cipher.mjs';
+
+const digest = sha256(new TextEncoder().encode('hello'));
+const hmac = hmacSha256(new Uint8Array([0x00, 0x01]), new Uint8Array([0x02, 0x03]));
+const derived = pbkdf2Sha256(
+  new TextEncoder().encode('password'),
+  new TextEncoder().encode('salt'),
+  100000,
+  32,
+);
 ```
 
 ## Running Tests
-The tests executed are primarily Known-Answer Tests (KAT), designed to verify the correctness of the encryption and decryption processes by comparing the results against pre-validated outputs. These tests ensure that the implementation matches the expected outputs for given inputs. A file containing a subset of the tests that have been executed without errors is available for review. The test data was sourced from the [NIST Cryptographic Algorithm Validation Program (CAVP)](https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program/block-ciphers). In the future, more extensive debugging and additional test cases will be added to cover edge cases and improve overall reliability.
+Everything lives in `test.mjs`. It covers:
+- NIST AES-ECB/CBC/CTR/CFB/OFB/GCM Known Answer Tests (128/192/256-bit keys).
+- Regression tests for CBC/PCBC round-trips, PKCS#7 errors, missing IV, etc.
+- A 256 KiB payload encryption/decryption sanity check.
+- A chaos fuzz harness mixing valid/invalid option combinations.
 
-To perform a simple test, run the following command:
-
+Execute the full battery with:
 ```bash
 node test.mjs
 ```
 
-This will execute a basic encryption and decryption test with predefined values. You can modify the \`key\`, \`plaintext\`, and other options within the \`simpleTest\` function to test different scenarios as needed. This allows for easy experimentation and verification of the implementation's behavior with different configurations.
+Environment variables:
+- `CHAOS_ITERATIONS=1000` — increase fuzz depth.
+- `CHAOS_SEED=feedface` — reproduce a specific random stream.
 
-## Future Goals
-- **Support for Additional Modes**: Implement modes like GCM, PCBC, CFB, OFB, and CTR.
-- **Enhanced Error Handling**: Build more comprehensive error handling and recovery mechanisms.
-- **Optimize Galois Field Operations**: Refactor the operations to eliminate tables like RCON and improve efficiency.
-- **Design a Generic Cipher Class**: Make AES an extension of a more generic Cipher class for supporting various cryptographic algorithms.
+## Security Notes
+- This project is for educational / controlled usage. Pure-JS crypto is inherently slower and more side-channel-prone than native implementations.
+- There is **no Math.random fallback**. If a secure RNG is not available, the constructor throws; provide a custom `rng` that returns a `Uint8Array`.
+- HMAC is enabled by default for block/stream modes; AES-GCM provides its own authentication tag and ignores `addHMAC`.
+- CFB requires plaintext lengths to be 16-byte aligned when PKCS#7 padding is disabled.
+
+## Future Work
+- Streaming API for incremental encrypt/decrypt without buffering entire payloads.
+- Additional authenticated constructions (GCM-SIV, SIV, XTS) and key-wrapping helpers.
+- Benchmark suite and performance tuning of GF arithmetic / GCM multiplication.
 
 ## License
-Copyright © 2024 Mario G. Ciavarella
-
-All rights reserved. This code and all associated files and documentation (the "Software")
-are protected by copyright law. Unauthorized copying of this file, via any medium, is
-strictly prohibited unless explicitly authorized by the copyright holder.
-
-Permission is hereby granted to use, reproduce, or modify this Software exclusively
-for educational, non-commercial, or internal purposes. Any other use requires the prior
-written consent of the copyright holder.
-
-DISCLAIMER: This Software is provided "as is", without any warranty of any kind.
-
-For inquiries regarding licensing or use of this code, contact: mariog.ciavarella@icloud.com
+See [LICENSE](./LICENSE).
