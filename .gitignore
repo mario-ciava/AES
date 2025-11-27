@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+*.min.js
+
+# Cache
+.DS_Store
+*.log
+
+# IDE
+.vscode/
+.idea/

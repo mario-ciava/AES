@@ -2,8 +2,18 @@
 All notable changes to this project will be documented in this file.
 This project adheres to [Keep a Changelog](https://keepachangelog.com/) and uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-- (placeholder)
+## [0.3.0] - 2025-11-27
+### Added
+- Dedicated MAC key derivation (HKDF-style) so AES and HMAC keys are never reused.
+- Streaming API for CTR/CFB/OFB (`createEncryptStream` / `createDecryptStream`) with hex/text chunks.
+- CFB now supports partial tails without padding; no block-length alignment required.
+
+### Changed
+- CTR counter increments now throw on 32-bit overflow instead of silently wrapping.
+- HMAC is computed with the derived MAC key (not the AES key); defaults unchanged for users.
+
+### Removed
+- Math.random fallback had already been dropped; buffered and streaming APIs both require secure RNG when IV/salt generation is requested.
 
 ## [0.2.0] - 2025-10-26
 ### Added

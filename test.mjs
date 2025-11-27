@@ -340,7 +340,18 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     assertEq('AES-128-CFB KAT decrypt', dec.message, pt);
   }
 
-  // 6) AES-128 OFB — SP 800-38A KAT
+  // 6.1) AES-128 CFB — partial tail allowed
+  {
+    const aes = new AES();
+    const key = '000102030405060708090a0b0c0d0e0f';
+    const iv = '0f0e0d0c0b0a09080706050403020100';
+    const ptHex = textToHex('partial blocks are fine');
+    const enc = aes.encrypt(ptHex, key, { mode: 'CFB', usePKCS7: false, addHMAC: false, IV: iv });
+    const dec = aes.decrypt(enc.message, key, { mode: 'CFB', usePKCS7: false, addHMAC: false, IV: iv });
+    assertEq('CFB partial round-trip', dec.message, ptHex);
+  }
+
+  // 7) AES-128 OFB — SP 800-38A KAT
   {
     const aes = new AES();
     const key = '2b7e151628aed2a6abf7158809cf4f3c';
@@ -450,7 +461,29 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     );
   }
 
-  // 11) Large payload round-trip (256 KiB)
+  // 11) Streaming CTR round-trip
+  {
+    const aes = new AES();
+    const key = '00112233445566778899aabbccddeeff';
+    const iv = '11223344556677889900aabbccddeeff';
+    const plain = 'Streaming CTR data';
+
+    const encStream = aes.createEncryptStream(key, { mode: 'CTR', IV: iv, addHMAC: false });
+    const c1 = encStream.update(plain.slice(0, 10));
+    const c2 = encStream.update(plain.slice(10));
+    encStream.final();
+
+    const decStream = aes.createDecryptStream(key, { mode: 'CTR', IV: encStream.IV, addHMAC: false });
+    const d1 = decStream.update(c1);
+    const d2 = decStream.update(c2);
+    decStream.final();
+    const recovered = d1 + d2;
+
+    assertEq('Streaming CTR round-trip', recovered, textToHex(plain));
+    assertEq('Streaming CTR IV passthrough', decStream.IV, iv);
+  }
+
+  // 12) Large payload round-trip (256 KiB)
   {
     const blockBytes = 16 * 1024; // 16 KiB units
     const blocks = 16; // total 256 KiB
@@ -465,7 +498,7 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     assertEq('Large payload CBC round-trip', dec.message, payloadHex);
   }
 
-  // 12) Negative: missing IV in CBC
+  // 13) Negative: missing IV in CBC
   {
     const key = '00112233445566778899aabbccddeeff';
     const pt  = '001122';
@@ -484,7 +517,7 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     );
   }
 
-  // 13) Negative: corrupted PKCS#7 padding
+  // 14) Negative: corrupted PKCS#7 padding
   {
     const key = '00112233445566778899aabbccddeeff';
     const aes = new AES();
@@ -499,7 +532,7 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     );
   }
 
-  // 14) Negative: disable PKCS#7 with uneven length
+  // 15) Negative: disable PKCS#7 with uneven length
   {
     const key = '00112233445566778899aabbccddeeff';
     const aes = new AES();
@@ -510,7 +543,7 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     );
   }
 
-  // 15) Legacy ASCII inputs and uppercase ciphertext
+  // 16) Legacy ASCII inputs and uppercase ciphertext
   {
     const aes = new AES();
     const keyAscii = 'abcdefghijklmnop'; // 16 ASCII bytes => 128-bit key
@@ -523,7 +556,7 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     assertEq('Uppercase ciphertext accepted', decUpper.message, textToHex(text));
   }
 
-  // 16) Hex normalization (spaces and 0x prefix)
+  // 17) Hex normalization (spaces and 0x prefix)
   {
     const aes = new AES();
     const canonicalKey = '00112233445566778899aabbccddeeff';
@@ -539,7 +572,7 @@ const chaosMonkey = (iterations = 100, seed = 'ce10d00d') => {
     assertEq('Hex normalization matches canonical decrypt', decFancy.message, canonicalPlain);
   }
 
-  // 17) createAES helper honors supplied defaults.
+  // 18) createAES helper honors supplied defaults.
   {
     const aes256 = createAES({ bits: 256, addHMAC: false, rng: makeRNG('feedf00d') });
     const key = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f';
