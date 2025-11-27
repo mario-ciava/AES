@@ -10,7 +10,8 @@ All primitives – AES core, PKCS#7, SHA‑256, HMAC-SHA256, PBKDF2-HMAC – are
 - AES-128, AES-192, AES-256 (fixed 128-bit blocks).
 - Modes: ECB, CBC, PCBC, CTR, CFB, OFB, GCM (with native auth tag).
 - Automatic or explicit PKCS#7 padding for block modes.
-- Optional PBKDF2 key derivation and HMAC-SHA256 authentication (auto-disabled for GCM).
+- Optional PBKDF2 key derivation; MAC key is always derived separately via HMAC-SHA256 expand.
+- Streaming API for CTR/CFB/OFB with hex/text inputs, no dependencies.
 - Pure utility exports (`sha256`, `hmacSha256`, `pbkdf2Sha256`, `timingSafeEqualHex`, etc.).
 - Large regression suite: NIST KATs, fuzzing, 256 KiB block stress test.
 
@@ -61,7 +62,7 @@ The library relies on a **secure random source**. If `globalThis.crypto.getRando
 Out of the box:
 - Mode: `CBC`.
 - Padding: PKCS#7 enabled.
-- HMAC-SHA256 on `(IV || salt || ciphertext)`.
+- HMAC-SHA256 on `(IV || salt || ciphertext)` using a MAC-only key derived from the provided secret.
 - Random IV generated per encryption.
 - No implicit key stretching unless `deriveKey` is true.
 - When `mode: 'GCM'`, the library disables HMAC automatically and returns the GCM authentication tag.
@@ -138,6 +139,26 @@ const dec = aes.decrypt(enc.message, 'ComplexKey', {
 console.log('Plain (hex):', dec.message);
 ```
 
+### Streaming CTR (no padding, no HMAC)
+```javascript
+const aes = new AES();
+const key = '00112233445566778899aabbccddeeff';
+const iv = '11223344556677889900aabbccddeeff';
+
+const encStream = aes.createEncryptStream(key, { mode: 'CTR', IV: iv, addHMAC: false });
+const c1 = encStream.update('streaming ');
+const c2 = encStream.update('cipher');
+encStream.final(); // flushes nothing (CTR is streaming)
+
+const decStream = aes.createDecryptStream(key, { mode: 'CTR', IV: encStream.IV, addHMAC: false });
+const p1 = decStream.update(c1);
+const p2 = decStream.update(c2);
+decStream.final();
+
+const plainHex = p1 + p2; // hex string
+console.log(Buffer.from(plainHex, 'hex').toString('utf8'));
+```
+
 ### Creating a preconfigured instance
 ```javascript
 import { createAES } from './cipher.mjs';
@@ -186,7 +207,7 @@ Environment variables:
 - This project is for educational / controlled usage. Pure-JS crypto is inherently slower and more side-channel-prone than native implementations.
 - There is **no Math.random fallback**. If a secure RNG is not available, the constructor throws; provide a custom `rng` that returns a `Uint8Array`.
 - HMAC is enabled by default for block/stream modes; AES-GCM provides its own authentication tag and ignores `addHMAC`.
-- CFB requires plaintext lengths to be 16-byte aligned when PKCS#7 padding is disabled.
+- Streaming helpers currently support CTR/CFB/OFB and intentionally disable HMAC to avoid buffering; use the buffered API when you need MACs on large payloads.
 
 ## Future Work
 - Streaming API for incremental encrypt/decrypt without buffering entire payloads.

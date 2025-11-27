@@ -1,7 +1,7 @@
 // AES core with local primitives.
 
 import { rCon, sBoxReverse, genSBoxValue } from './assets.mjs';
-import { normalizeHex, textToHex as utf8ToHex } from './prototypeExtensions.mjs';
+import { normalizeHex, textToHex as utf8ToHex, textToBytes } from './prototypeExtensions.mjs';
 
 // --- hex/byte helpers ---
 const isHex = (s) => normalizeHex(s, { allowEmpty: true }) !== null;
@@ -32,20 +32,18 @@ const xorBlock = (a, b) => {
   return out;
 };
 
-const inc32 = (block) => {
-  const out = new Uint8Array(block);
-  for (let i = 15; i >= 12; i--) {
-    out[i] = (out[i] + 1) & 0xff;
-    if (out[i] !== 0) break;
-  }
-  return out;
-};
+const inc32 = (block) => inc32InPlace(new Uint8Array(block));
 
 const inc32InPlace = (block) => {
+  let overflow = true;
   for (let i = 15; i >= 12; i--) {
     block[i] = (block[i] + 1) & 0xff;
-    if (block[i] !== 0) break;
+    if (block[i] !== 0) {
+      overflow = false;
+      break;
+    }
   }
+  if (overflow) throw new Error('CTR counter overflow');
   return block;
 };
 
@@ -145,6 +143,16 @@ const ensureHexString = (value, { label, allowEmpty, allowTextFallback }) => {
   const hex = utf8ToHex(str);
   if (!hex.length && !allowEmpty) throw new Error(`${label} cannot be empty`);
   return hex;
+};
+
+const normalizeInputBytes = (value) => {
+  if (value instanceof Uint8Array) return value;
+  if (typeof value === 'string') {
+    const normalized = normalizeHex(value, { allowEmpty: true });
+    if (normalized !== null && normalized.length % 2 === 0) return hexToBytes(normalized);
+    return textToBytes(value);
+  }
+  throw new Error('Stream input must be string or Uint8Array');
 };
 
 const defaultRandomBytes = (length) => {
@@ -309,6 +317,26 @@ export const pbkdf2Sha256 = (passwordBytes, saltBytes, iterations, dkLen) => {
   }
   return DK;
 };
+
+// hkdfExpand: minimal HKDF-expand using HMAC-SHA256 with provided key as PRK.
+const hkdfExpand = (prkBytes, infoBytes, outLen) => {
+  if (!Number.isInteger(outLen) || outLen <= 0) throw new Error('HKDF: invalid outLen');
+  const blockLen = 32;
+  const blocks = Math.ceil(outLen / blockLen);
+  let t = new Uint8Array(0);
+  const out = new Uint8Array(outLen);
+  let offset = 0;
+  for (let i = 1; i <= blocks; i++) {
+    const data = concatBytes(concatBytes(t, infoBytes), new Uint8Array([i]));
+    t = hmacSha256(prkBytes, data);
+    const take = Math.min(blockLen, outLen - offset);
+    out.set(t.subarray(0, take), offset);
+    offset += take;
+  }
+  return out;
+};
+
+const HKDF_INFO_MAC = textToBytes('AES-MAC');
 
 // timingSafeEqualHex: constant-time compare.
 export const timingSafeEqualHex = (aHex, bHex) => {
@@ -526,29 +554,31 @@ const encryptCTRBytes = (plain, w, Nr, ivBytes) => {
 };
 
 const encryptCFBBytes = (plain, w, Nr, ivBytes) => {
-  ensureMultipleOfBlock(plain, 'CFB');
   const out = new Uint8Array(plain.length);
   let state = new Uint8Array(ivBytes);
   for (let off = 0; off < plain.length; off += 16) {
     const keystream = encryptBlock(state, w, Nr);
-    const block = plain.subarray(off, off + 16);
-    const cipher = xorBytes(block, keystream);
+    const chunkLen = Math.min(16, plain.length - off);
+    const block = plain.subarray(off, off + chunkLen);
+    const cipher = new Uint8Array(chunkLen);
+    for (let i = 0; i < chunkLen; i++) cipher[i] = block[i] ^ keystream[i];
     out.set(cipher, off);
-    state = cipher;
+    state = cipher.length === 16 ? cipher : concatBytes(state.subarray(cipher.length), cipher);
   }
   return out;
 };
 
 const decryptCFBBytes = (cipher, w, Nr, ivBytes) => {
-  ensureMultipleOfBlock(cipher, 'CFB');
   const out = new Uint8Array(cipher.length);
   let state = new Uint8Array(ivBytes);
   for (let off = 0; off < cipher.length; off += 16) {
     const keystream = encryptBlock(state, w, Nr);
-    const block = cipher.subarray(off, off + 16);
-    const plain = xorBytes(block, keystream);
+    const chunkLen = Math.min(16, cipher.length - off);
+    const block = cipher.subarray(off, off + chunkLen);
+    const plain = new Uint8Array(chunkLen);
+    for (let i = 0; i < chunkLen; i++) plain[i] = block[i] ^ keystream[i];
     out.set(plain, off);
-    state = new Uint8Array(block);
+    state = block.length === 16 ? new Uint8Array(block) : concatBytes(state.subarray(block.length), block);
   }
   return out;
 };
@@ -670,17 +700,19 @@ export const AES = class {
     const rngFn = this.#defaultSettings.rng || defaultRandomBytes;
     return bytesToHex(rngFn(length));
   }
+  createEncryptStream(plainKeyHex, options = {}) { return this.#createStream(/*isEncrypt=*/true, plainKeyHex, options); }
+  createDecryptStream(plainKeyHex, options = {}) { return this.#createStream(/*isEncrypt=*/false, plainKeyHex, options); }
 
   encrypt(plainTextHex, plainKeyHex, options = {}) {
-    const { hexText, hexKey, settings } = this.#validateEncryptionInput(plainTextHex, plainKeyHex, options);
-    const { cipherHex, tagHex } = this.#performEncryption(hexText, hexKey, settings);
+    const { hexText, encKeyHex, macKeyHex, settings } = this.#validateEncryptionInput(plainTextHex, plainKeyHex, options);
+    const { cipherHex, tagHex } = this.#performEncryption(hexText, encKeyHex, settings);
 
     const macDataBytes = concatBytes(
       settings.IV ? hexToBytes(settings.IV) : new Uint8Array(0),
       settings.addSalt && settings.salt ? hexToBytes(settings.salt) : new Uint8Array(0)
     );
     const macFull = concatBytes(macDataBytes, hexToBytes(cipherHex));
-    const hmacHex = settings.addHMAC ? bytesToHex(hmacSha256(hexToBytes(hexKey), macFull)) : null;
+    const hmacHex = settings.addHMAC ? bytesToHex(hmacSha256(hexToBytes(macKeyHex), macFull)) : null;
 
     return {
       message: cipherHex,
@@ -694,7 +726,7 @@ export const AES = class {
   }
 
   decrypt(cipherTextHex, plainKeyHex, options = {}) {
-    const { hexText, hexKey, settings } = this.#validateDecryptionInput(cipherTextHex, plainKeyHex, options);
+    const { hexText, encKeyHex, macKeyHex, settings } = this.#validateDecryptionInput(cipherTextHex, plainKeyHex, options);
 
     if (settings.HMAC) {
       const macDataBytes = concatBytes(
@@ -702,13 +734,13 @@ export const AES = class {
         settings.addSalt && settings.salt ? hexToBytes(settings.salt) : new Uint8Array(0)
       );
       const macFull = concatBytes(macDataBytes, hexToBytes(hexText));
-      const exp = bytesToHex(hmacSha256(hexToBytes(hexKey), macFull));
+      const exp = bytesToHex(hmacSha256(hexToBytes(macKeyHex), macFull));
       if (!timingSafeEqualHex(exp, settings.HMAC)) throw new Error('HMAC verification failed');
     } else if (settings.addHMAC) {
       throw new Error('HMAC required but not provided');
     }
 
-    const { plainHex } = this.#performDecryption(hexText, hexKey, settings);
+    const { plainHex } = this.#performDecryption(hexText, encKeyHex, settings);
     return {
       message: plainHex,
       IV: settings.IV || null,
@@ -717,6 +749,63 @@ export const AES = class {
       tag: settings.tag || null,
       AAD: settings.AAD || null,
       instance: this,
+    };
+  }
+
+  #createStream(isEncrypt, plainKeyHex, options) {
+    const { encKeyHex, settings } = this.#prepareStreamSettings(plainKeyHex, options, /*forDecryption=*/!isEncrypt);
+    const key = hexToBytes(encKeyHex);
+    const { w, Nr } = keyExpansion(key);
+    const ivBytes = hexToBytes(settings.IV);
+
+    let counter = settings.mode === 'CTR' ? new Uint8Array(ivBytes) : null;
+    let feedback = settings.mode === 'CFB' ? new Uint8Array(ivBytes) : null;
+    let ofbState = settings.mode === 'OFB' ? new Uint8Array(ivBytes) : null;
+
+    const processChunk = (inputBytes) => {
+      switch (settings.mode) {
+        case 'CTR': {
+          const out = new Uint8Array(inputBytes.length);
+          for (let off = 0; off < inputBytes.length; off += 16) {
+            const ks = encryptBlock(counter, w, Nr);
+            const chunkLen = Math.min(16, inputBytes.length - off);
+            for (let i = 0; i < chunkLen; i++) out[off + i] = inputBytes[off + i] ^ ks[i];
+            inc32InPlace(counter);
+          }
+          return out;
+        }
+        case 'OFB': {
+          const out = new Uint8Array(inputBytes.length);
+          for (let off = 0; off < inputBytes.length; off += 16) {
+            ofbState = encryptBlock(ofbState, w, Nr);
+            const chunkLen = Math.min(16, inputBytes.length - off);
+            for (let i = 0; i < chunkLen; i++) out[off + i] = inputBytes[off + i] ^ ofbState[i];
+          }
+          return out;
+        }
+        case 'CFB': {
+          const out = new Uint8Array(inputBytes.length);
+          for (let off = 0; off < inputBytes.length; off += 16) {
+            const ks = encryptBlock(feedback, w, Nr);
+            const chunkLen = Math.min(16, inputBytes.length - off);
+            const seg = inputBytes.subarray(off, off + chunkLen);
+            const block = new Uint8Array(chunkLen);
+            for (let i = 0; i < chunkLen; i++) block[i] = seg[i] ^ ks[i];
+            out.set(block, off);
+            const nextFeedback = isEncrypt ? block : seg;
+            feedback = concatBytes(feedback.subarray(chunkLen), nextFeedback);
+          }
+          return out;
+        }
+        default:
+          throw new Error(`Streaming not supported for ${settings.mode}`);
+      }
+    };
+
+    return {
+      IV: settings.IV,
+      update: (chunk) => bytesToHex(processChunk(normalizeInputBytes(chunk))),
+      final: () => ({ IV: settings.IV }),
     };
   }
 
@@ -734,6 +823,36 @@ export const AES = class {
     return true;
   }
 
+  #prepareStreamSettings(keyInput, options, forDecryption) {
+    this.#validateSettings(options);
+    const settings = { ...this.#defaultSettings, ...options };
+
+    const keyHex = ensureHexString(keyInput, { label: 'Key', allowEmpty: false, allowTextFallback: true });
+    const { encKeyHex, usedSalt } = this.#transformKey(keyHex, settings, forDecryption);
+    settings.salt = usedSalt;
+
+    const streamingModes = new Set(['CTR', 'CFB', 'OFB']);
+    if (!streamingModes.has(settings.mode)) throw new Error(`Streaming not supported for ${settings.mode}`);
+    settings.usePKCS7 = false;
+    settings.addHMAC = false;
+    settings.AAD = null;
+    settings.tag = null;
+
+    if (settings.IV) {
+      const normalized = AES.#validSettings.IV(settings.IV);
+      const ivLen = normalized.length / 2;
+      if (ivLen !== 16) throw new Error(`${settings.mode} IV must be 16 bytes`);
+      settings.IV = normalized;
+    } else {
+      if (!settings.rng && forDecryption) throw new Error(`${settings.mode} requires an IV`);
+      const generated = settings.rng ? settings.rng(16) : defaultRandomBytes(16);
+      if (!(generated instanceof Uint8Array) || generated.length !== 16) throw new Error('options.rng must return a Uint8Array of length 16');
+      settings.IV = bytesToHex(generated);
+    }
+
+    return { encKeyHex, settings };
+  }
+
   #validateEncryptionInput(plainInput, keyInput, options) {
     this.#validateSettings(options);
     const settings = { ...this.#defaultSettings, ...options };
@@ -741,7 +860,7 @@ export const AES = class {
     const plainHex = ensureHexString(plainInput, { label: 'Plaintext', allowEmpty: true, allowTextFallback: true });
     const keyHex = ensureHexString(keyInput, { label: 'Key', allowEmpty: false, allowTextFallback: true });
 
-    const { finalKeyHex, usedSalt } = this.#transformKey(keyHex, settings, /*forDecryption=*/false);
+    const { encKeyHex, macKeyHex, usedSalt } = this.#transformKey(keyHex, settings, /*forDecryption=*/false);
     settings.salt = usedSalt;
 
     const streamingModes = new Set(['CTR', 'CFB', 'OFB', 'GCM']);
@@ -772,7 +891,7 @@ export const AES = class {
 
     settings.tag = null;
 
-    return { hexText: plainHex, hexKey: finalKeyHex, settings };
+    return { hexText: plainHex, encKeyHex, macKeyHex, settings };
   }
 
   #validateDecryptionInput(cipherInput, keyInput, options) {
@@ -782,7 +901,7 @@ export const AES = class {
     const cipherHex = ensureHexString(cipherInput, { label: 'Ciphertext', allowEmpty: false, allowTextFallback: false });
     const keyHex = ensureHexString(keyInput, { label: 'Key', allowEmpty: false, allowTextFallback: true });
 
-    const { finalKeyHex } = this.#transformKey(keyHex, settings, /*forDecryption=*/true);
+    const { encKeyHex, macKeyHex } = this.#transformKey(keyHex, settings, /*forDecryption=*/true);
 
     const streamingModes = new Set(['CTR', 'CFB', 'OFB', 'GCM']);
     if (streamingModes.has(settings.mode)) settings.usePKCS7 = false;
@@ -810,25 +929,38 @@ export const AES = class {
       settings.tag = null;
     }
 
-    return { hexText: cipherHex, hexKey: finalKeyHex, settings };
+    return { hexText: cipherHex, encKeyHex, macKeyHex, settings };
   }
 
   #transformKey(keyHex, settings, forDecryption) {
     const keyBytesLen = settings.bits / 8;
 
+    const deriveSaltHex = () => {
+      if (settings.salt) return settings.salt;
+      if (settings.addSalt && settings.rng && !forDecryption) return bytesToHex(settings.rng(16));
+      throw new Error('PBKDF2 requires a salt (provide options.salt or options.rng)');
+    };
+
+    let prkBytes;
+    let usedSalt = null;
+
     if (settings.deriveKey) {
-      // PBKDF2 needs a salt.
-      let saltHex = settings.salt;
-      if (!saltHex) {
-        if (settings.addSalt && settings.rng && !forDecryption) saltHex = bytesToHex(settings.rng(16));
-        else throw new Error('PBKDF2 requires a salt (provide options.salt or options.rng)');
-      }
-      const dk = pbkdf2Sha256(hexToBytes(keyHex), hexToBytes(saltHex), settings.iterations ?? 100000, keyBytesLen);
-      return { finalKeyHex: bytesToHex(dk), usedSalt: saltHex };
+      usedSalt = deriveSaltHex();
+      prkBytes = pbkdf2Sha256(hexToBytes(keyHex), hexToBytes(usedSalt), settings.iterations ?? 100000, keyBytesLen);
+    } else {
+      if (keyHex.length !== keyBytesLen * 2) throw new Error(`Invalid key size | Expected ${settings.bits}-bit key`);
+      prkBytes = hexToBytes(keyHex);
+      usedSalt = settings.addSalt ? (settings.salt || null) : null;
     }
 
-    if (keyHex.length !== keyBytesLen * 2) throw new Error(`Invalid key size | Expected ${settings.bits}-bit key`);
-    return { finalKeyHex: keyHex, usedSalt: settings.addSalt ? (settings.salt || null) : null };
+    const encKeyBytes = prkBytes;
+    const macKeyBytes = hkdfExpand(prkBytes, HKDF_INFO_MAC, 32);
+
+    return {
+      encKeyHex: bytesToHex(encKeyBytes),
+      macKeyHex: bytesToHex(macKeyBytes),
+      usedSalt,
+    };
   }
 
   // --- encrypt/decrypt ---
@@ -858,9 +990,7 @@ export const AES = class {
         return { cipherHex: bytesToHex(cipherBytes), tagHex: null };
       }
       case 'CFB': {
-        const input = settings.usePKCS7 ? pkcs7Pad(plain, 16) : plain;
-        if (!settings.usePKCS7) ensureMultipleOfBlock(input, 'CFB');
-        const cipherBytes = encryptCFBBytes(input, w, Nr, hexToBytes(settings.IV));
+        const cipherBytes = encryptCFBBytes(plain, w, Nr, hexToBytes(settings.IV));
         return { cipherHex: bytesToHex(cipherBytes), tagHex: null };
       }
       case 'OFB': {
@@ -907,9 +1037,7 @@ export const AES = class {
         return { plainHex: bytesToHex(plain) };
       }
       case 'CFB': {
-        ensureMultipleOfBlock(cipher, 'CFB');
-        let plain = decryptCFBBytes(cipher, w, Nr, hexToBytes(settings.IV));
-        if (settings.usePKCS7) plain = pkcs7Unpad(plain, 16);
+        const plain = decryptCFBBytes(cipher, w, Nr, hexToBytes(settings.IV));
         return { plainHex: bytesToHex(plain) };
       }
       case 'OFB': {
